@@ -1,107 +1,78 @@
 #!/bin/bash
 
 # ==============================================================
-# 🚀 X-UI 智能引导安装脚本 (环境修复 + 证书向导 + 自动安装)
+# 🚀 X-UI 极简系统环境修复 & 全自动安装脚本
+# ==============================================================
+# 功能列表：
+# 1. 自动补全 Debian/CentOS 缺失的基础依赖 (cron, socat, lsof等)
+# 2. 自动安装 acme.sh 并强制切换为 Let's Encrypt (免邮箱/免验证)
+# 3. 自动检测并杀掉占用 80 端口的进程 (Nginx/Apache)
+# 4. 自动拉起 3x-ui 安装脚本，并自动确认 "是否安装" 的回车步骤
 # ==============================================================
 
+# 定义颜色，看起来更专业
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 PLAIN='\033[0m'
 
-# 1. 基础环境修复 (静默执行)
-echo -e "${YELLOW}正在初始化系统环境...${PLAIN}"
+echo -e "${YELLOW}正在检查系统环境...${PLAIN}"
+
+# --------------------------------------------------------------
+# 第一步：暴力补全依赖 (针对 DMIT/搬瓦工 等精简镜像)
+# --------------------------------------------------------------
 if [ -f /etc/debian_version ]; then
-    apt update -y && apt install -y cron socat curl lsof tar openssl
-    systemctl enable cron && systemctl start cron
+    # Debian/Ubuntu
+    apt update -y
+    # 强制安装 cron, socat, lsof, curl, tar (防止脚本运行中途找不到命令)
+    apt install -y cron socat curl lsof tar
+    systemctl enable cron
+    systemctl start cron
 elif [ -f /etc/redhat-release ]; then
-    yum update -y && yum install -y cronie socat curl lsof tar openssl
-    systemctl enable crond && systemctl start crond
+    # CentOS/AlmaLinux
+    yum update -y
+    yum install -y cronie socat curl lsof tar
+    systemctl enable crond
+    systemctl start crond
 fi
 
-# 2. 端口清理 (静默执行)
-if lsof -i :80 | grep -q "LISTEN"; then
-    echo -e "${YELLOW}释放 80 端口...${PLAIN}"
-    lsof -t -i:80 | xargs kill -9 2>/dev/null
-fi
+echo -e "${GREEN}依赖环境安装完毕！${PLAIN}"
 
-# ==============================================================
-# 🎯 交互式证书向导 (核心修改部分)
-# ==============================================================
-clear
-echo -e "========================================================"
-echo -e "${GREEN}             X-UI 证书配置向导             ${PLAIN}"
-echo -e "========================================================"
-echo -e "请选择你的证书模式："
-echo -e "  ${GREEN}1.${PLAIN} 我有域名 (申请 Let's Encrypt 真实证书，推荐)"
-echo -e "  ${GREEN}2.${PLAIN} 我没有域名 (生成 IP 自签名证书，浏览器会提示不安全)"
-echo -e "========================================================"
-read -p "请输入选项 [1-2] (默认1): " ssl_choice
-[ -z "$ssl_choice" ] && ssl_choice="1"
-
-# 准备存放证书的目录
-mkdir -p /root/cert
-
-if [ "$ssl_choice" == "1" ]; then
-    # --- 选项1：域名证书 ---
-    read -p "请输入你的域名 (例如 your.com): " user_domain
-    if [ -z "$user_domain" ]; then
-        echo -e "${RED}错误：域名不能为空！${PLAIN}"
-        exit 1
-    fi
-
-    # 安装 acme.sh 并申请
-    echo -e "${YELLOW}正在安装 acme.sh 并申请证书...${PLAIN}"
+# --------------------------------------------------------------
+# 第二步：解决 acme.sh 的 ZeroSSL 邮箱验证死循环
+# --------------------------------------------------------------
+if ! command -v ~/.acme.sh/acme.sh &> /dev/null; then
+    echo -e "${YELLOW}正在安装 acme.sh...${PLAIN}"
     curl https://get.acme.sh | sh
-    ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
-    ~/.acme.sh/acme.sh --issue -d "$user_domain" --standalone --force
-
-    # 安装证书到指定目录
-    ~/.acme.sh/acme.sh --install-cert -d "$user_domain" \
-        --key-file       /root/cert/private.key \
-        --fullchain-file /root/cert/cert.crt
-    
-    CERT_PATH="/root/cert/cert.crt"
-    KEY_PATH="/root/cert/private.key"
-    echo -e "${GREEN}域名证书申请完成！${PLAIN}"
-
-else
-    # --- 选项2：IP 自签名证书 ---
-    echo -e "${YELLOW}正在检测公网 IP 并生成自签名证书...${PLAIN}"
-    public_ip=$(curl -s4 ifconfig.me)
-    
-    openssl req -x509 -newkey rsa:2048 -nodes -sha256 -keyout /root/cert/private.key -out /root/cert/cert.crt -days 3650 -subj "/C=US/ST=Earth/L=City/O=X-UI/OU=IT/CN=$public_ip"
-    
-    CERT_PATH="/root/cert/cert.crt"
-    KEY_PATH="/root/cert/private.key"
-    echo -e "${GREEN}IP 自签名证书生成完成！(有效期10年)${PLAIN}"
 fi
 
-# ==============================================================
-# 🚀 自动安装 X-UI 面板
-# ==============================================================
-echo -e "${YELLOW}正在启动 X-UI 安装程序...${PLAIN}"
+echo -e "${YELLOW}正在切换证书默认机构为 Let's Encrypt (跳过邮箱验证)...${PLAIN}"
+# 这一步是关键，防止出现 "Please update your account with an email" 报错
+~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
 
-# 这里你可以修改默认的账号密码端口
-bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh) <<EOF
-y
-admin
-admin
-54321
-EOF
+# --------------------------------------------------------------
+# 第三步：端口 80 大扫除
+# --------------------------------------------------------------
+echo -e "${YELLOW}正在检测 80 端口占用...${PLAIN}"
+if lsof -i :80 | grep -q "LISTEN"; then
+    echo -e "${RED}检测到 80 端口被占用，正在执行强制清理...${PLAIN}"
+    # 优先停止服务
+    systemctl stop nginx 2>/dev/null
+    systemctl stop apache2 2>/dev/null
+    systemctl stop httpd 2>/dev/null
+    # 强制杀进程 (双重保险)
+    lsof -t -i:80 | xargs kill -9 2>/dev/null
+    echo -e "${GREEN}80 端口已释放。${PLAIN}"
+else
+    echo -e "${GREEN}80 端口空闲，检测通过。${PLAIN}"
+fi
 
-# ==============================================================
-# 🏁 结束汇总
-# ==============================================================
-clear
-echo -e "========================================================"
-echo -e "${GREEN}           安装全部完成！(Install Complete)           ${PLAIN}"
-echo -e "========================================================"
-echo -e "面板地址: ${YELLOW}http://$(curl -s4 ifconfig.me):54321${PLAIN}"
-echo -e "用户名:   ${YELLOW}admin${PLAIN}"
-echo -e "密码:     ${YELLOW}admin${PLAIN}"
-echo -e "--------------------------------------------------------"
-echo -e "请进入面板 -> 面板设置 -> Xray配置，填入以下路径："
-echo -e "公钥路径 (Certificate): ${GREEN}$CERT_PATH${PLAIN}"
-echo -e "私钥路径 (Private Key): ${GREEN}$KEY_PATH${PLAIN}"
-echo -e "========================================================"
+# --------------------------------------------------------------
+# 第四步：拉起原版 3x-ui 脚本 (自动确认安装)
+# --------------------------------------------------------------
+echo -e "${GREEN}环境准备就绪，正在启动 X-UI 安装程序...${PLAIN}"
+echo -e "${YELLOW}提示：已自动帮你跳过安装确认，请直接设置账号密码。${PLAIN}"
+
+# 解释：这里使用了 <<< "y" 将 "y" 自动输入给脚本
+# 解决了你遇到的 "需要手动按一下回车确认安装" 的问题
+bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh) <<< "y"
