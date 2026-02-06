@@ -19,21 +19,67 @@ PLAIN='\033[0m'
 echo -e "${YELLOW}正在检查系统环境...${PLAIN}"
 
 # --------------------------------------------------------------
-# 第一步：暴力补全依赖 (针对 DMIT/搬瓦工 等精简镜像)
+# 第一步：暴力补全依赖 (针对 DMIT/搬瓦工/OVH 等各种镜像优化)
 # --------------------------------------------------------------
 if [ -f /etc/debian_version ]; then
     # Debian/Ubuntu
-    apt update -y
-    # 强制安装 cron, socat, lsof, curl, tar (防止脚本运行中途找不到命令)
-    apt install -y cron socat curl lsof tar
+    echo -e "${YELLOW}检测到 Debian/Ubuntu 系统，正在优化软件源并更新...${PLAIN}"
+    
+    # [新增] 1. 强力清理旧缓存 (解决 Hash Sum mismatch 问题)
+    rm -rf /var/lib/apt/lists/*
+    
+    # 2. 尝试常规更新
+    apt-get update -y
+    
+    # [新增] 3. 安装依赖 (增加 --fix-missing 自动修复参数)
+    echo -e "${YELLOW}正在安装基础依赖 (cron, socat, curl)...${PLAIN}"
+    apt-get install -y --fix-missing cron socat curl lsof tar
+
+    # [新增] 4. 失败检测与自动换源 (解决 OVH 404 问题)
+    if ! command -v socat &> /dev/null; then
+        echo -e "${RED}依赖安装失败 (可能是镜像源损坏)，正在尝试切换回官方源重试...${PLAIN}"
+        
+        # 备份源文件
+        cp /etc/apt/sources.list /etc/apt/sources.list.bak
+        
+        # 智能识别系统并替换源
+        if grep -q "Ubuntu" /etc/issue || grep -q "Ubuntu" /etc/os-release; then
+            # Ubuntu: 替换为 archive.ubuntu.com
+            sed -i 's/http:\/\/.*\.com/http:\/\/archive.ubuntu.com/g' /etc/apt/sources.list
+            sed -i 's/http:\/\/.*\.net/http:\/\/archive.ubuntu.com/g' /etc/apt/sources.list
+            sed -i 's/http:\/\/.*\.org/http:\/\/archive.ubuntu.com/g' /etc/apt/sources.list
+        else
+            # Debian: 替换为 deb.debian.org
+            sed -i 's/http:\/\/.*\.com/http:\/\/deb.debian.org/g' /etc/apt/sources.list
+            sed -i 's/http:\/\/.*\.net/http:\/\/deb.debian.org/g' /etc/apt/sources.list
+            sed -i 's/http:\/\/.*\.org/http:\/\/deb.debian.org/g' /etc/apt/sources.list
+        fi
+        
+        # 再次清理并更新
+        rm -rf /var/lib/apt/lists/*
+        apt-get update -y
+        apt-get install -y --fix-missing cron socat curl lsof tar
+    fi
+
     systemctl enable cron
     systemctl start cron
+
 elif [ -f /etc/redhat-release ]; then
     # CentOS/AlmaLinux
+    echo -e "${YELLOW}检测到 CentOS/RedHat 系统，正在更新...${PLAIN}"
+    yum clean all
+    yum makecache
     yum update -y
     yum install -y cronie socat curl lsof tar
     systemctl enable crond
     systemctl start crond
+fi
+
+# 再次检查关键依赖 socat 是否存在，确保不带病运行
+if ! command -v socat &> /dev/null; then
+    echo -e "${RED}严重错误：依赖 (socat) 安装失败，脚本无法继续。${PLAIN}"
+    echo -e "${RED}请尝试手动执行: apt-get update && apt-get install -y socat${PLAIN}"
+    exit 1
 fi
 
 echo -e "${GREEN}依赖环境安装完毕！${PLAIN}"
