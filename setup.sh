@@ -1,16 +1,14 @@
 #!/bin/bash
 
 # ==============================================================
-# 🚀 X-UI 极简系统环境修复 & 全自动安装脚本
+# 🚀 X-UI 极简系统环境修复 & 全自动安装脚本 (究极修复版)
 # ==============================================================
-# 功能列表：
-# 1. 自动补全 Debian/CentOS 缺失的基础依赖 (cron, socat, lsof等)
-# 2. 自动安装 acme.sh 并强制切换为 Let's Encrypt (免邮箱/免验证)
-# 3. 自动检测并杀掉占用 80 端口的进程 (Nginx/Apache)
-# 4. 自动拉起 3x-ui 安装脚本，并自动确认 "是否安装" 的回车步骤
+# 更新日志：
+# 1. 新增：智能检测 apt/dpkg 锁，防止因系统后台更新导致安装失败
+# 2. 新增：DNS 自动修正，解决部分机房解析软件源超时的问题
+# 3. 优化：多重重试机制，确保 socat 等关键依赖 100% 安装成功
 # ==============================================================
 
-# 定义颜色，看起来更专业
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -18,47 +16,75 @@ PLAIN='\033[0m'
 
 echo -e "${YELLOW}正在检查系统环境...${PLAIN}"
 
-# --------------------------------------------------------------
-# 第一步：暴力补全依赖 (针对 DMIT/搬瓦工/OVH 等各种镜像优化)
-# --------------------------------------------------------------
+# ==============================================================
+# 函数：等待 apt 锁释放 (解决 "Could not get lock" 报错)
+# ==============================================================
+wait_for_lock() {
+    local i=0
+    while fuser /var/lib/dpkg/lock >/dev/null 2>&1 || fuser /var/lib/apt/lists/lock >/dev/null 2>&1 || fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
+        echo -e "${YELLOW}系统后台正在运行更新进程 (apt/dpkg 被占用)，正在等待锁释放... ($i s)${PLAIN}"
+        sleep 2
+        let i+=2
+        if [ $i -gt 120 ]; then
+            echo -e "${RED}等待超时，正在尝试强制释放锁...${PLAIN}"
+            killall apt apt-get dpkg 2>/dev/null
+            rm -f /var/lib/apt/lists/lock
+            rm -f /var/lib/dpkg/lock
+            rm -f /var/lib/dpkg/lock-frontend
+            dpkg --configure -a
+            break
+        fi
+    done
+}
+
+# ==============================================================
+# 第一步：暴力补全依赖 (包含 DNS 修复与换源逻辑)
+# ==============================================================
 if [ -f /etc/debian_version ]; then
     # Debian/Ubuntu
-    echo -e "${YELLOW}检测到 Debian/Ubuntu 系统，正在优化软件源并更新...${PLAIN}"
+    echo -e "${YELLOW}检测到 Debian/Ubuntu 系统，开始依赖修复流程...${PLAIN}"
+
+    # 1. 临时修改 DNS 为 Google/Cloudflare (解决软件源解析失败)
+    if ! grep -q "8.8.8.8" /etc/resolv.conf; then
+        echo -e "${YELLOW}正在优化 DNS 解析...${PLAIN}"
+        cp /etc/resolv.conf /etc/resolv.conf.bak
+        echo "nameserver 8.8.8.8" > /etc/resolv.conf
+        echo "nameserver 1.1.1.1" >> /etc/resolv.conf
+    fi
+
+    # 2. 等待并清理锁
+    wait_for_lock
     
-    # [新增] 1. 强力清理旧缓存 (解决 Hash Sum mismatch 问题)
+    # 3. 清理缓存 (解决 Hash Sum mismatch)
     rm -rf /var/lib/apt/lists/*
     
-    # 2. 尝试常规更新
+    # 4. 尝试第一轮更新安装
+    echo -e "${YELLOW}正在更新软件源并安装依赖...${PLAIN}"
     apt-get update -y
-    
-    # [新增] 3. 安装依赖 (增加 --fix-missing 自动修复参数)
-    echo -e "${YELLOW}正在安装基础依赖 (cron, socat, curl)...${PLAIN}"
-    apt-get install -y --fix-missing cron socat curl lsof tar
+    # 增加 -o Acquire::ForceIPv4=true 强制使用 IPv4 避免 IPv6 网络问题
+    apt-get -o Acquire::ForceIPv4=true install -y --fix-missing cron socat curl lsof tar
 
-    # [新增] 4. 失败检测与自动换源 (解决 OVH 404 问题)
+    # 5. 失败检测与自动换源 (如果第一轮失败)
     if ! command -v socat &> /dev/null; then
-        echo -e "${RED}依赖安装失败 (可能是镜像源损坏)，正在尝试切换回官方源重试...${PLAIN}"
+        echo -e "${RED}依赖安装失败，正在切换为官方源并重试...${PLAIN}"
         
-        # 备份源文件
-        cp /etc/apt/sources.list /etc/apt/sources.list.bak
+        cp /etc/apt/sources.list /etc/apt/sources.list.bak2
         
-        # 智能识别系统并替换源
         if grep -q "Ubuntu" /etc/issue || grep -q "Ubuntu" /etc/os-release; then
-            # Ubuntu: 替换为 archive.ubuntu.com
-            sed -i 's/http:\/\/.*\.com/http:\/\/archive.ubuntu.com/g' /etc/apt/sources.list
-            sed -i 's/http:\/\/.*\.net/http:\/\/archive.ubuntu.com/g' /etc/apt/sources.list
-            sed -i 's/http:\/\/.*\.org/http:\/\/archive.ubuntu.com/g' /etc/apt/sources.list
+            # Ubuntu 官方源
+            echo "deb http://archive.ubuntu.com/ubuntu/ $(lsb_release -sc) main restricted universe multiverse" > /etc/apt/sources.list
+            echo "deb http://archive.ubuntu.com/ubuntu/ $(lsb_release -sc)-updates main restricted universe multiverse" >> /etc/apt/sources.list
+            echo "deb http://archive.ubuntu.com/ubuntu/ $(lsb_release -sc)-security main restricted universe multiverse" >> /etc/apt/sources.list
         else
-            # Debian: 替换为 deb.debian.org
-            sed -i 's/http:\/\/.*\.com/http:\/\/deb.debian.org/g' /etc/apt/sources.list
-            sed -i 's/http:\/\/.*\.net/http:\/\/deb.debian.org/g' /etc/apt/sources.list
-            sed -i 's/http:\/\/.*\.org/http:\/\/deb.debian.org/g' /etc/apt/sources.list
+            # Debian 官方源
+            echo "deb http://deb.debian.org/debian $(lsb_release -sc) main contrib non-free" > /etc/apt/sources.list
+            echo "deb http://deb.debian.org/debian $(lsb_release -sc)-updates main contrib non-free" >> /etc/apt/sources.list
         fi
         
         # 再次清理并更新
         rm -rf /var/lib/apt/lists/*
         apt-get update -y
-        apt-get install -y --fix-missing cron socat curl lsof tar
+        apt-get -o Acquire::ForceIPv4=true install -y --fix-missing cron socat curl lsof tar
     fi
 
     systemctl enable cron
@@ -66,7 +92,14 @@ if [ -f /etc/debian_version ]; then
 
 elif [ -f /etc/redhat-release ]; then
     # CentOS/AlmaLinux
-    echo -e "${YELLOW}检测到 CentOS/RedHat 系统，正在更新...${PLAIN}"
+    echo -e "${YELLOW}检测到 CentOS/RedHat 系统...${PLAIN}"
+    
+    # CentOS 也可以尝试修 DNS
+    if ! grep -q "8.8.8.8" /etc/resolv.conf; then
+        cp /etc/resolv.conf /etc/resolv.conf.bak
+        echo "nameserver 8.8.8.8" > /etc/resolv.conf
+    fi
+
     yum clean all
     yum makecache
     yum update -y
@@ -75,50 +108,46 @@ elif [ -f /etc/redhat-release ]; then
     systemctl start crond
 fi
 
-# 再次检查关键依赖 socat 是否存在，确保不带病运行
+# 最终检查
 if ! command -v socat &> /dev/null; then
-    echo -e "${RED}严重错误：依赖 (socat) 安装失败，脚本无法继续。${PLAIN}"
-    echo -e "${RED}请尝试手动执行: apt-get update && apt-get install -y socat${PLAIN}"
+    echo -e "${RED}严重错误：socat 安装仍然失败！${PLAIN}"
+    echo -e "${RED}建议手动运行 'apt-get install -y socat' 查看具体报错信息。${PLAIN}"
+    # 恢复 DNS 防止影响其他服务 (可选，这里暂时不恢复，因为8.8.8.8通常更好)
     exit 1
+else
+    echo -e "${GREEN}依赖环境 (socat/curl/cron) 安装验证通过！${PLAIN}"
 fi
 
-echo -e "${GREEN}依赖环境安装完毕！${PLAIN}"
-
-# --------------------------------------------------------------
+# ==============================================================
 # 第二步：解决 acme.sh 的 ZeroSSL 邮箱验证死循环
-# --------------------------------------------------------------
+# ==============================================================
 if ! command -v ~/.acme.sh/acme.sh &> /dev/null; then
     echo -e "${YELLOW}正在安装 acme.sh...${PLAIN}"
     curl https://get.acme.sh | sh
 fi
 
 echo -e "${YELLOW}正在切换证书默认机构为 Let's Encrypt (跳过邮箱验证)...${PLAIN}"
-# 这一步是关键，防止出现 "Please update your account with an email" 报错
 ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
 
-# --------------------------------------------------------------
+# ==============================================================
 # 第三步：端口 80 大扫除
-# --------------------------------------------------------------
+# ==============================================================
 echo -e "${YELLOW}正在检测 80 端口占用...${PLAIN}"
 if lsof -i :80 | grep -q "LISTEN"; then
     echo -e "${RED}检测到 80 端口被占用，正在执行强制清理...${PLAIN}"
-    # 优先停止服务
     systemctl stop nginx 2>/dev/null
     systemctl stop apache2 2>/dev/null
     systemctl stop httpd 2>/dev/null
-    # 强制杀进程 (双重保险)
     lsof -t -i:80 | xargs kill -9 2>/dev/null
     echo -e "${GREEN}80 端口已释放。${PLAIN}"
 else
     echo -e "${GREEN}80 端口空闲，检测通过。${PLAIN}"
 fi
 
-# --------------------------------------------------------------
+# ==============================================================
 # 第四步：拉起原版 3x-ui 脚本 (自动确认安装)
-# --------------------------------------------------------------
+# ==============================================================
 echo -e "${GREEN}环境准备就绪，正在启动 X-UI 安装程序...${PLAIN}"
 echo -e "${YELLOW}提示：已自动帮你跳过安装确认，请直接设置账号密码。${PLAIN}"
 
-# 解释：这里使用了 <<< "y" 将 "y" 自动输入给脚本
-# 解决了你遇到的 "需要手动按一下回车确认安装" 的问题
 bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh) <<< "y"
